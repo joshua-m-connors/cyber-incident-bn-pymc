@@ -202,10 +202,20 @@ Combines BN posterior with Monte Carlo progression simulation.
 
 ---
 
-# Recommended Practices
-(Original section preserved here…)
+## Recommended Practices
+
+1. Calibrate mitigation ranges regularly  
+2. Use relevance templates to focus on specific actors  
+3. Review dependency and group definitions to ensure realistic modeling  
+4. Validate modeled AAL and SLE against internal data  
+5. Version all CSV inputs to preserve analytic lineage  
 
 ---
 
-# License
-(Original license content preserved.)
+FAIR–MITRE ATT&CK Quantitative Cyber Risk Framework
+
+Copyright 2025 Joshua M. Connors
+
+Licensed under the Apache License, Version 2.0.
+
+This software incorporates public data from the MITRE ATT&CK® framework.
