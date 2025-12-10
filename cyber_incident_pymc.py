@@ -322,8 +322,13 @@ def _print_stage_control_map(stage_map, tactics_included):
 
 def _success_interval_from_control(block_lo: float, block_hi: float):
     """
-    Convert control block interval (fraction) → attacker success interval.
-    success = 1 - block
+    Convert control block interval (fraction) to a susceptibility interval.
+
+    Here:
+      - block_lo, block_hi are control strengths (block probabilities) in [0..0.95]
+      - we compute an interval for attacker SUCCESS after controls but
+        before Threat Capability is applied:
+          success = 1 - block
     """
     block_lo = max(0.0, min(0.95, block_lo))
     block_hi = max(0.0, min(0.95, block_hi))
@@ -503,34 +508,43 @@ def _simulate_attacker_path(sim_struct, rng, tc=None, tech_posteriors=None, reco
                 "retries": 0,
                 "fallback": False
             })
-
         # Technique priors for that tactic
         priors = technique_priors.get(tactic_name, {}).get(tech_id)
 
         # --------------------------------------------------------
-        # SUCCESS probability (BN posterior if available)
+        # SUCCESS probability (susceptibility after controls)
+        #   - priors["p_min"], priors["p_max"] are success bounds in [0..1]
+        #   - tech_posteriors, if available, give BN posterior samples for
+        #     the same success probability (before capability).
         # --------------------------------------------------------
         if priors is not None:
-            p_min = float(priors.get("p_min", 0.0))
-            p_max = float(priors.get("p_max", 1.0))
+            succ_min = float(priors.get("p_min", 0.0))
+            succ_max = float(priors.get("p_max", 1.0))
 
             if tech_posteriors is not None:
                 key_succ = (tactic_name, tech_id, "success")
                 post_arr = tech_posteriors.get(key_succ)
                 if post_arr is not None and post_arr.size > 0:
                     idx = rng.integers(0, post_arr.size)
+                    # Posterior sample is already a success probability in [0,1]
                     p_stage = float(np.clip(post_arr[idx], 0.0, 1.0))
                 else:
-                    p_stage = float(np.clip(rng.uniform(p_min, p_max), 0.0, 1.0))
+                    # Fall back to prior interval
+                    p_stage = float(np.clip(rng.uniform(succ_min, succ_max), 0.0, 1.0))
             else:
-                p_stage = float(np.clip(rng.uniform(p_min, p_max), 0.0, 1.0))
+                p_stage = float(np.clip(rng.uniform(succ_min, succ_max), 0.0, 1.0))
         else:
+            # No prior info for this technique; use neutral success before capability
             p_stage = 0.5
 
-        # Threat capability modifies technique-level success probability
+        # Threat Capability modifies technique-level success probability
+        # in a FAIR-consistent way:
+        #   vulnerability v = TC * Susceptibility
+        # This guarantees:
+        #   - v <= tc for all techniques
+        #   - stronger controls (lower p_stage) produce lower v
         if tc is not None:
-            p_stage = p_stage + tc * (1.0 - p_stage)
-            p_stage = float(np.clip(p_stage, 0.0, 1.0))
+            p_stage = float(np.clip(tc * p_stage, 0.0, 1.0))
 
         # --------------------------------------------------------
         # DETECTION probability (BN posterior if available)
@@ -1099,18 +1113,22 @@ def _simulate_annual_losses(lambda_draws, succ_chain_draws, succ_mat,
                         if step.get("result") == "success":
                             technique_successes[tech_key] = technique_successes.get(tech_key, 0) + 1
             else:
-                # Tactic-level mode - use posterior or prior stage success probabilities
+                # Tactic-level mode - use posterior or prior stage susceptibility
                 if succ_mat is not None:
+                    # succ_mat[idx] is the sampled success probability after controls
                     stage_success_probs = succ_mat[idx].astype(float)
                 else:
+                    # Draw success probability after controls from the Beta priors
                     stage_success_probs = rng.beta(alphas, betas).astype(float)
 
-                # Apply baseline Threat Capability to stage success probabilities
-                stage_success_probs = np.clip(
-                    stage_success_probs + tc * (1.0 - stage_success_probs),
-                    0.0,
-                    1.0,
-                )
+                # Apply Threat Capability as a ceiling:
+                #   vulnerability v_stage = tc * susceptibility_stage
+                # This preserves the BN posterior over susceptibility and ensures:
+                #   - v_stage <= tc for every stage
+                #   - stronger controls (lower susceptibility) reduce v_stage
+                stage_success_probs = np.clip(tc * stage_success_probs, 0.0, 1.0)
+
+                chain_success = _simulate_attacker_path_tactics(stage_success_probs, rng)
 
                 chain_success = _simulate_attacker_path_tactics(stage_success_probs, rng)
 

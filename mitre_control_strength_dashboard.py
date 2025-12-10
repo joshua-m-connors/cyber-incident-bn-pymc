@@ -102,6 +102,17 @@ def load_relevance_filter(file_path: str):
     kept[tech_col] = kept[tech_col].astype(str).str.strip()
     return set(kept[tech_col].dropna().unique()), set(kept[tactic_col].dropna().unique())
 
+def compute_relevance_sets(file_path: str):
+    """
+    Thin wrapper for technique simulation that returns the same
+    (technique_ids, tactic_names) sets produced by load_relevance_filter.
+
+    This exists so get_technique_simulation_inputs can call a dedicated
+    helper without duplicating CSV parsing logic. Any errors here are
+    allowed to propagate and are handled by the caller's try/except.
+    """
+    tech_ids, tactic_names = load_relevance_filter(file_path)
+    return tech_ids, tactic_names
 
 def _compute_effective_mitigation_strengths(csv: pd.DataFrame, seed: int | None = None) -> Dict[str, Tuple[float, float]]:
     """Compute dependency- and group-adjusted mitigation strengths.
@@ -318,6 +329,12 @@ def compute_technique_strengths(
             "p_max": float,
             "mitigations": [list of mitigation external_ids]
         }
+
+    IMPORTANT:
+      - mitigation_strengths are BLOCK probabilities in percent
+      - this function converts them to technique-level ATTACKER SUCCESS
+        probabilities (susceptibility) after controls, before capability.
+      - p_min and p_max in the returned dict are success probabilities in [0..1].
     """
 
     # ------------------------------------------------------------
@@ -355,7 +372,8 @@ def compute_technique_strengths(
         tech_to_mit.setdefault(tech_ext, []).append(mit_ext)
 
     # ------------------------------------------------------------
-    # STEP 2: Aggregate mitigation strengths into technique strengths
+    # STEP 2: Aggregate mitigation strengths into technique-level
+    #         BLOCK probabilities, then convert to SUCCESS
     # ------------------------------------------------------------
     technique_strengths = {}
 
@@ -366,7 +384,7 @@ def compute_technique_strengths(
         for mit_ext in mit_list:
             if mit_ext in mitigation_strengths:
                 lo, hi = mitigation_strengths[mit_ext]
-                # Convert percent → probability
+                # Convert percent → probability (block)
                 s_min_values.append(max(0.0, min(1.0, lo / 100.0)))
                 s_max_values.append(max(0.0, min(1.0, hi / 100.0)))
             else:
@@ -375,19 +393,19 @@ def compute_technique_strengths(
                 s_max_values.append(0.0)
 
         if not s_min_values:
-            # Technique has no mitigations; treat as unmitigated
+            # Technique has no mitigations; treat as unmitigated (full success)
             technique_strengths[tech_ext] = {
-                "p_min": 0.0,
-                "p_max": 0.0,
+                "p_min": 1.0,   # success min
+                "p_max": 1.0,   # success max
                 "mitigations": []
             }
             continue
 
         # --------------------------------------------------------
-        # DEFENSE-IN-DEPTH AGGREGATION (mathematically correct)
+        # DEFENSE IN DEPTH at the mitigation level (block space)
         #
-        # combined_min = 1 − ∏(1 − s_min_i)
-        # combined_max = 1 − ∏(1 − s_max_i)
+        # combined_block_min = 1 − ∏(1 − s_min_i)
+        # combined_block_max = 1 − ∏(1 − s_max_i)
         # --------------------------------------------------------
 
         prod_min_fail = 1.0
@@ -399,12 +417,22 @@ def compute_technique_strengths(
         for s_hi in s_max_values:
             prod_max_fail *= (1.0 - s_hi)
 
-        p_min = 1.0 - prod_min_fail
-        p_max = 1.0 - prod_max_fail
+        block_min = 1.0 - prod_min_fail
+        block_max = 1.0 - prod_max_fail
+
+        # Clamp block probabilities
+        block_min = max(0.0, min(0.99, block_min))
+        block_max = max(0.0, min(0.99, block_max))
+
+        # Convert to attacker SUCCESS (susceptibility) interval
+        succ_min = 1.0 - block_max
+        succ_max = 1.0 - block_min
+        if succ_min > succ_max:
+            succ_min, succ_max = succ_max, succ_min
 
         technique_strengths[tech_ext] = {
-            "p_min": max(0.0, min(0.99, p_min)),
-            "p_max": max(0.0, min(0.99, p_max)),
+            "p_min": succ_min,
+            "p_max": succ_max,
             "mitigations": sorted(set(mit_list))
         }
 
@@ -648,15 +676,22 @@ def get_technique_simulation_inputs(
         {
             "tactics": [ ordered tactic names ],
             "techniques_by_tactic": { tactic: [tech_id, ...] },
-            "technique_priors": { tactic: { tech_id: {p_min, p_max} } }
+            "technique_priors": {
+                tactic: {
+                    tech_id: {
+                        "p_min": attacker success min (susceptibility) in [0..1],
+                        "p_max": attacker success max (susceptibility) in [0..1]
+                    }
+                }
+            }
         }
 
-    Technique strengths are derived from:
+    Technique success priors are derived from:
         - STIX technique→mitigation relationships
-        - Effective mitigation strengths (after group health and dependency logic)
-        - Defense-in-depth aggregation: p = 1 − ∏(1 − s_i)
+        - effective mitigation strengths (after group health and dependency logic)
+        - defense in depth aggregation in BLOCK space, then converted to
+          SUCCESS via success = 1 - block.
     """
-
     # ----------------------------------------------------------------------
     # LOAD STIX OBJECTS
     # ----------------------------------------------------------------------
