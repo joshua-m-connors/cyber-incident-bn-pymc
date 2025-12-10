@@ -388,6 +388,8 @@ def _simulate_attacker_path(sim_struct, rng, tc=None, tech_posteriors=None, reco
         - Adaptability gates retries only
         - Threat capability (tc) modifies technique success probability
     """
+    # At top of function, before mode split:
+    path_log = [] if record_path else None
 
     # ------------------------------------------------------------
     # Stage-level (tactic) simulation
@@ -458,7 +460,7 @@ def _simulate_attacker_path(sim_struct, rng, tc=None, tech_posteriors=None, reco
             else:
                 return False
 
-        return i >= n_stages
+        return (i >= n_stages, path_log) if record_path else (i >= n_stages)
 
     # ------------------------------------------------------------
     # Technique-level simulation
@@ -544,8 +546,14 @@ def _simulate_attacker_path(sim_struct, rng, tc=None, tech_posteriors=None, reco
         retries_left = MAX_RETRIES_PER_STAGE
         stage_completed = False
 
+        if record_path:
+            path_log[-1]["success_prob"] = p_stage
+            path_log[-1]["detect_prob"] = detect_prob
+
         while retries_left > 0:
             if rng.random() < p_stage:
+                if record_path:
+                    path_log[-1]["result"] = "success"
                 current_tactic_index += 1
                 stage_completed = True
                 break
@@ -554,7 +562,9 @@ def _simulate_attacker_path(sim_struct, rng, tc=None, tech_posteriors=None, reco
             detect_prob = min(1.0, detect_prob + delta)
 
             if rng.random() < detect_prob:
-                return False
+                if record_path:
+                    path_log[-1]["result"] = "detected"
+                return (False, path_log) if record_path else False
 
             retries_left -= 1
             if record_path:
@@ -578,10 +588,11 @@ def _simulate_attacker_path(sim_struct, rng, tc=None, tech_posteriors=None, reco
             fallback_count += 1
             if record_path:
                 path_log[-1]["fallback"] = True
+            current_tactic_index -= 1
             continue
         else:
-            if record_path and path_log and path_log[-1]["outcome"] is None:
-                path_log[-1]["outcome"] = "fail"
+            if record_path and path_log and path_log[-1]["result"] is None:
+                path_log[-1]["result"] = "fail"
             return (False, path_log) if record_path else False
 
     result = current_tactic_index >= n_tactics
@@ -1030,6 +1041,10 @@ def _simulate_annual_losses(lambda_draws, succ_chain_draws, succ_mat,
     reg_losses  = np.zeros(n, dtype=float)
     rep_losses  = np.zeros(n, dtype=float)
 
+    # Technique statistics (aggregated across all posterior draws)
+    technique_attempts = {}
+    technique_successes = {}
+
     # Pre-extract ranges (converted to [0..1]) for the two impact controls
     backup_lo = backup_hi = encrypt_lo = encrypt_hi = 0.0
     backup_mean = encrypt_mean = 0.0
@@ -1068,12 +1083,21 @@ def _simulate_annual_losses(lambda_draws, succ_chain_draws, succ_mat,
         for _ in range(max(0, attempts)):
             # Technique-level mode - use technique_sim_struct and apply tc in the path
             if technique_inputs_available and technique_sim_struct:
-                chain_success = _simulate_attacker_path(
+                chain_success, path = _simulate_attacker_path(
                     technique_sim_struct,
                     rng,
                     tc=tc,
                     tech_posteriors=technique_posteriors,
+                    record_path=True,
                 )
+
+                # Aggregate per technique stats from this path
+                if path is not None:
+                    for step in path:
+                        tech_key = (step["tactic"], step["technique"])
+                        technique_attempts[tech_key] = technique_attempts.get(tech_key, 0) + 1
+                        if step.get("result") == "success":
+                            technique_successes[tech_key] = technique_successes.get(tech_key, 0) + 1
             else:
                 # Tactic-level mode - use posterior or prior stage success probabilities
                 if succ_mat is not None:
@@ -1154,6 +1178,42 @@ def _simulate_annual_losses(lambda_draws, succ_chain_draws, succ_mat,
         resp_losses[idx] = resp_acc
         reg_losses[idx]  = reg_acc
         rep_losses[idx]  = rep_acc
+
+    # Summarize top techniques by number of attempts (technique mode only)
+    if technique_attempts:
+        technique_rows = []
+        for (tactic, tech), attempts in technique_attempts.items():
+            succ = technique_successes.get((tactic, tech), 0)
+            rate = succ / attempts if attempts > 0 else 0.0
+            technique_rows.append((tactic, tech, attempts, succ, rate))
+
+        # Sort by attempts descending
+        technique_rows.sort(key=lambda r: r[2], reverse=True)
+        top_ten = technique_rows[:10]
+
+        print("\nTop 10 techniques by attempts (technique mode only):")
+        for tactic, tech, attempts, succ, rate in top_ten:
+            print(
+                f"{tactic} / {tech}: attempts={attempts}, successes={succ}, success_rate={rate:.1%}"
+            )
+
+        # Save to CSV in the same output directory
+        ts = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+        csv_path = os.path.join(OUTPUT_DIR, f"top_techniques_{ts}.csv")
+        df = pd.DataFrame(
+            [
+                {
+                    "Tactic": tactic,
+                    "Technique": tech,
+                    "Attempts": attempts,
+                    "Successes": succ,
+                    "SuccessRate": rate,
+                }
+                for tactic, tech, attempts, succ, rate in top_ten
+            ]
+        )
+        df.to_csv(csv_path, index=False)
+        print(f"✅ Saved top technique statistics -> {csv_path}")
 
     LAST_CATEGORY_LOSSES = {
         "Productivity": prod_losses,
