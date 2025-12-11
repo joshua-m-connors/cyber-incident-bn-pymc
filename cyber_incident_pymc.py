@@ -67,6 +67,7 @@ import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
 from matplotlib.ticker import FuncFormatter
+from scipy.stats import gaussian_kde
 
 # Optional import for technique-level simulation inputs
 try:
@@ -429,7 +430,7 @@ def _simulate_attacker_path(sim_struct, rng, tc=None, tech_posteriors=None, reco
                 if rng.random() < p_stage:
                     if record_path:
                         path_log[-1]["result"] = "success"
-                    current_tactic_index += 1
+                    i += 1
                     stage_completed = True
                     break
 
@@ -801,7 +802,7 @@ def _sample_posterior_lambda_and_success(alphas: np.ndarray, betas: np.ndarray, 
             draws=N_SAMPLES,
             tune=N_TUNE,
             chains=N_CHAINS,
-            cores=1,
+            cores=N_CHAINS,
             target_accept=TARGET_ACCEPT,
             random_seed=RANDOM_SEED,
             progressbar=True,
@@ -921,12 +922,25 @@ def build_technique_bn_model(
                 p_min = float(pri["p_min"])
                 p_max = float(pri["p_max"])
 
-                # Convert [p_min, p_max] into a Beta prior suitable for a BN
+                # Convert [p_min, p_max] into a Beta prior suitable for a BN.
+                # We keep the center at the midpoint, but cap the overall
+                # concentration so that alpha+beta cannot explode when the
+                # interval is extremely narrow.
                 center = 0.5 * (p_min + p_max)
-                width = max(1e-6, abs(p_max - p_min))
+                # Keep center inside (0,1) for numerical stability
+                center = min(max(center, 1e-6), 1.0 - 1e-6)
 
-                alpha = max(1.0, center * prior_strength / width)
-                beta = max(1.0, (1.0 - center) * prior_strength / width)
+                width = abs(p_max - p_min)
+                # Treat any interval narrower than 0.05 as "tight" for k scaling
+                eff_width = max(width, 0.05)
+
+                # Base concentration proportional to inverse width, but capped
+                k_raw = prior_strength / eff_width
+                # Clamp k between 2 and 200 to avoid extreme shapes
+                k = float(min(max(k_raw, 2.0), 200.0))
+
+                alpha = max(1.0, center * k)
+                beta = max(1.0, (1.0 - center) * k)
 
                 # Name node safely
                 node_name = (
@@ -952,10 +966,16 @@ def build_technique_bn_model(
                 p_det_max = float(pri.get("p_detect_max", 1.0))
 
                 det_center = 0.5 * (p_det_min + p_det_max)
-                det_width = max(1e-6, abs(p_det_max - p_det_min))
+                det_center = min(max(det_center, 1e-6), 1.0 - 1e-6)
 
-                det_alpha = max(1.0, det_center * prior_strength / det_width)
-                det_beta  = max(1.0, (1.0 - det_center) * prior_strength / det_width)
+                det_width = abs(p_det_max - p_det_min)
+                eff_width = max(det_width, 0.05)
+
+                k_raw = prior_strength / eff_width
+                k = float(min(max(k_raw, 2.0), 200.0))
+
+                det_alpha = max(1.0, det_center * k)
+                det_beta  = max(1.0, (1.0 - det_center) * k)
 
                 node_name = (
                     f"p_detect_{tactic.replace(' ', '_')}_"
@@ -989,9 +1009,17 @@ def build_technique_bn_model(
             if not techs_here:
                 continue
 
+            # Compute tactic-level success as the average susceptibility of its techniques.
+            # This keeps p_tactic between the min and max of the individual p_tech values
+            # instead of exploding toward 1.0 like a parallel OR.
+            if len(techs_here) == 1:
+                p_tactic = techs_here[0]
+            else:
+                p_tactic = pm.math.mean(pm.math.stack(techs_here))
+
             tactic_nodes[tactic] = pm.Deterministic(
                 f"p_tactic_{tactic.replace(' ', '_')}",
-                1.0 - pm.math.prod([1.0 - p for p in techs_here])
+                p_tactic
             )
 
         # ========================================================
@@ -1055,6 +1083,8 @@ def _simulate_annual_losses(lambda_draws, succ_chain_draws, succ_mat,
     reg_losses  = np.zeros(n, dtype=float)
     rep_losses  = np.zeros(n, dtype=float)
 
+    attempts_per_draw = np.zeros(n, dtype=int)
+
     # Technique statistics (aggregated across all posterior draws)
     technique_attempts = {}
     technique_successes = {}
@@ -1076,6 +1106,7 @@ def _simulate_annual_losses(lambda_draws, succ_chain_draws, succ_mat,
 
     for idx, lam in enumerate(lambda_draws):
         attempts = rng.poisson(lam=lam)
+        attempts_per_draw[idx] = max(0, attempts)
         succ_count = 0
         prod_acc = resp_acc = reg_acc = rep_acc = 0.0
         total_loss = 0.0
@@ -1112,6 +1143,7 @@ def _simulate_annual_losses(lambda_draws, succ_chain_draws, succ_mat,
                         technique_attempts[tech_key] = technique_attempts.get(tech_key, 0) + 1
                         if step.get("result") == "success":
                             technique_successes[tech_key] = technique_successes.get(tech_key, 0) + 1
+
             else:
                 # Tactic-level mode - use posterior or prior stage susceptibility
                 if succ_mat is not None:
@@ -1130,7 +1162,8 @@ def _simulate_annual_losses(lambda_draws, succ_chain_draws, succ_mat,
 
                 chain_success = _simulate_attacker_path_tactics(stage_success_probs, rng)
 
-                chain_success = _simulate_attacker_path_tactics(stage_success_probs, rng)
+                # BUGFIX: second call here was redundant and overwrote the first result.
+                # chain_success = _simulate_attacker_path_tactics(stage_success_probs, rng)
 
             if not chain_success:
                 continue
@@ -1202,17 +1235,18 @@ def _simulate_annual_losses(lambda_draws, succ_chain_draws, succ_mat,
         technique_rows = []
         for (tactic, tech), attempts in technique_attempts.items():
             succ = technique_successes.get((tactic, tech), 0)
+            failures = attempts - succ
             rate = succ / attempts if attempts > 0 else 0.0
-            technique_rows.append((tactic, tech, attempts, succ, rate))
+            technique_rows.append((tactic, tech, attempts, succ, failures, rate))
 
         # Sort by attempts descending
         technique_rows.sort(key=lambda r: r[2], reverse=True)
         top_ten = technique_rows[:10]
 
         print("\nTop 10 techniques by attempts (technique mode only):")
-        for tactic, tech, attempts, succ, rate in top_ten:
+        for tactic, tech, attempts, succ, failures, rate in top_ten:
             print(
-                f"{tactic} / {tech}: attempts={attempts}, successes={succ}, success_rate={rate:.1%}"
+                f"{tactic} / {tech}: attempts={attempts}, successes={succ}, failures={failures}, success_rate={rate:.1%}"
             )
 
         # Save to CSV in the same output directory
@@ -1225,9 +1259,10 @@ def _simulate_annual_losses(lambda_draws, succ_chain_draws, succ_mat,
                     "Technique": tech,
                     "Attempts": attempts,
                     "Successes": succ,
+                    "Failures": failures,
                     "SuccessRate": rate,
                 }
-                for tactic, tech, attempts, succ, rate in top_ten
+                for tactic, tech, attempts, succ, failures, rate in top_ten
             ]
         )
         df.to_csv(csv_path, index=False)
@@ -1239,7 +1274,7 @@ def _simulate_annual_losses(lambda_draws, succ_chain_draws, succ_mat,
         "RegulatoryLegal": reg_losses,
         "ReputationCompetitive": rep_losses,
     }
-    return losses, successes
+    return losses, successes, attempts_per_draw
 
 # =============================================================================
 # Console output, viz, exports
@@ -1303,8 +1338,16 @@ def _annotate_percentiles(ax, samples, money=False):
 def _render_2x2_and_log_ale(losses: np.ndarray,
                             lambda_draws: np.ndarray,
                             success_chain_draws: np.ndarray,
+                            successes: np.ndarray,
+                            attempts_per_draw: np.ndarray,
                             show: bool = True):
     ts = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+    rate_sim = successes.astype(float)   # successes per year (exposure = 1 year)
+    # Use analytic posterior success metrics for the dashboard,
+    # consistent with the original MCMC model:
+    #   succ_chain_sim = success_chain_draws (end-to-end success probability)
+    #   succ_per_year  = lambda_draws * success_chain_draws (expected successful incidents/year)
+    succ_chain_sim = success_chain_draws.astype(float)
     succ_per_year = lambda_draws * success_chain_draws
 
     def _auto_clip(data, low=0.001, high=0.991):
@@ -1314,8 +1357,8 @@ def _render_2x2_and_log_ale(losses: np.ndarray,
         return data[(data >= low_v) & (data <= high_v)]
 
     lambda_plot = _auto_clip(lambda_draws)
-    succ_chain_plot = _auto_clip(success_chain_draws)
-    succ_per_year_plot = _auto_clip(succ_per_year)
+    succ_chain_plot = succ_chain_sim
+    succ_per_year_plot = succ_per_year
     losses_plot = _auto_clip(losses)
 
     def _millions(x, pos): return f"${x/1e6:,.1f}M"
@@ -1334,10 +1377,13 @@ def _render_2x2_and_log_ale(losses: np.ndarray,
     _annotate_percentiles(ax, succ_chain_plot, money=False)
 
     ax = axs[1,0]
-    ax.hist(succ_per_year_plot, bins=60, edgecolor="black")
+    ax.hist(rate_sim, bins=60, alpha=0.9, edgecolor='black')
+    kde = gaussian_kde(rate_sim)
+    xs = np.linspace(0, max(rate_sim) * 1.1, 400)
+    ax.plot(xs, kde(xs) * len(rate_sim) * (xs[1] - xs[0]), color='red', linewidth=1.2)
     ax.set_title("Successful Incidents / Year (posterior)")
     ax.set_xlabel("Incidents/year"); ax.set_ylabel("Count")
-    _annotate_percentiles(ax, succ_per_year_plot, money=False)
+    _annotate_percentiles(ax, rate_sim, money=False)
 
     ax = axs[1,1]
     ax.hist(losses_plot, bins=60, edgecolor="black")
@@ -1493,7 +1539,7 @@ def main():
 
 
     # Posterior predictive simulation (annual losses & incident counts)
-    losses, successes = _simulate_annual_losses(
+    losses, successes, attempts_per_draw = _simulate_annual_losses(
         lambda_draws=lambda_draws,
         succ_chain_draws=success_chain_draws,
         succ_mat=succ_mat,
@@ -1509,7 +1555,14 @@ def main():
 
     _print_aal_summary(losses, successes)
     _save_results_csvs(losses, successes, lambda_draws, success_chain_draws)
-    _render_2x2_and_log_ale(losses, lambda_draws, success_chain_draws, show=(not args.no_plot))
+    _render_2x2_and_log_ale(
+        losses,
+        lambda_draws,
+        success_chain_draws,
+        successes,
+        attempts_per_draw,
+        show=(not args.no_plot),
+    )
 
 # =============================================================================
 if __name__ == "__main__":
