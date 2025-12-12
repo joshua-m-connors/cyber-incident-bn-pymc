@@ -157,6 +157,21 @@ observed_total_incidents = None
 observed_years = None
 
 # =============================================================================
+# BN chain semantics configuration
+# =============================================================================
+# Controls how the BN computes tactic and chain success.
+#
+#   "legacy_mean_product"
+#       p_tactic = mean(p_tech)
+#       p_chain  = product(p_tactic)
+#
+#   "retry_detect_aware" (default)
+#       p_tactic approximates simulator retry + detection behavior
+#
+# This preserves legacy behavior while enabling FAIR-aligned semantics.
+BN_CHAIN_SEMANTICS = "retry_detect_aware"
+
+# =============================================================================
 # MITRE STAGES (canonical fallback)
 # =============================================================================
 MITRE_STAGES = [
@@ -882,6 +897,28 @@ def build_technique_bn_model(
     """
 
     import pymc as pm
+    # ------------------------------------------------------------
+    # Approximate per-technique probability of "win before detect"
+    # across multiple retries.
+    #
+    # This mirrors _simulate_attacker_path semantics in a BN-safe way.
+    # ------------------------------------------------------------
+    def _bn_tech_win_probability(p_succ, p_detect_base, p_detect_inc_mean, n_tries):
+        survive = 1.0
+        win = 0.0
+        n = int(max(1, n_tries))
+
+        for k in range(n):
+            d_k = pm.math.clip(
+                p_detect_base + k * p_detect_inc_mean,
+                0.0,
+                1.0
+            )
+
+            win = win + survive * p_succ
+            survive = survive * (1.0 - p_succ) * (1.0 - d_k)
+
+        return pm.math.clip(win, 0.0, 1.0)
 
     # ------------------------------------------------------------
     # Extract structures from technique_sim_struct
@@ -1009,13 +1046,38 @@ def build_technique_bn_model(
             if not techs_here:
                 continue
 
-            # Compute tactic-level success as the average susceptibility of its techniques.
-            # This keeps p_tactic between the min and max of the individual p_tech values
-            # instead of exploding toward 1.0 like a parallel OR.
-            if len(techs_here) == 1:
-                p_tactic = techs_here[0]
+            if BN_CHAIN_SEMANTICS == "legacy_mean_product":
+                # Legacy behavior: mean susceptibility across techniques
+                if len(techs_here) == 1:
+                    p_tactic = techs_here[0]
+                else:
+                    p_tactic = pm.math.mean(pm.math.stack(techs_here))
             else:
-                p_tactic = pm.math.mean(pm.math.stack(techs_here))
+                # Retry + detection aware tactic win probability
+                det_inc_mean = 0.5 * (float(DETECT_INC_MIN) + float(DETECT_INC_MAX))
+                p_det_base = float(DETECT_BASE)
+
+                tech_ids_here = [
+                    tech_id for (t, tech_id) in tech_nodes.keys()
+                    if t == tactic
+                ]
+
+                wins = []
+                for tech_id in tech_ids_here:
+                    p_node = tech_nodes[(tactic, tech_id)]
+                    d_node = detect_nodes.get((tactic, tech_id), p_det_base)
+
+                    wins.append(
+                        _bn_tech_win_probability(
+                            p_node,
+                            d_node,
+                            det_inc_mean,
+                            MAX_RETRIES_PER_STAGE
+                        )
+                    )
+
+                # Uniform technique selection
+                p_tactic = pm.math.mean(pm.math.stack(wins))
 
             tactic_nodes[tactic] = pm.Deterministic(
                 f"p_tactic_{tactic.replace(' ', '_')}",
@@ -1343,6 +1405,9 @@ def _render_2x2_and_log_ale(losses: np.ndarray,
                             show: bool = True):
     ts = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
     rate_sim = successes.astype(float)   # successes per year (exposure = 1 year)
+    # Implied per-attempt success probability from simulation
+    attempts_safe = np.where(attempts_per_draw > 0, attempts_per_draw, 1)
+    implied_success_prob = successes.astype(float) / attempts_safe.astype(float)
     # Use analytic posterior success metrics for the dashboard,
     # consistent with the original MCMC model:
     #   succ_chain_sim = success_chain_draws (end-to-end success probability)
@@ -1371,19 +1436,36 @@ def _render_2x2_and_log_ale(losses: np.ndarray,
     _annotate_percentiles(ax, lambda_plot, money=False)
 
     ax = axs[0,1]
-    ax.hist(succ_chain_plot, bins=60, edgecolor="black")
+    ax.hist(implied_success_prob, bins=60, alpha=0.9, edgecolor="black")
     ax.set_title("Posterior Success Probability (end-to-end)")
     ax.set_xlabel("Success prob"); ax.set_ylabel("Count")
-    _annotate_percentiles(ax, succ_chain_plot, money=False)
+    _annotate_percentiles(ax, implied_success_prob, money=False)
 
     ax = axs[1,0]
-    ax.hist(rate_sim, bins=60, alpha=0.9, edgecolor='black')
-    kde = gaussian_kde(rate_sim)
-    xs = np.linspace(0, max(rate_sim) * 1.1, 400)
-    ax.plot(xs, kde(xs) * len(rate_sim) * (xs[1] - xs[0]), color='red', linewidth=1.2)
+    # Plot histogram in COUNT space
+    counts, bin_edges, _ = ax.hist(
+        rate_sim,
+        bins=60,
+        alpha=0.9,
+        edgecolor="black"
+    )
+    # Compute correct bin width for scaling KDE to counts
+    bin_width = bin_edges[1] - bin_edges[0]
+    # KDE evaluated over the histogram range
+    if bin_edges[-1] > bin_edges[0]:
+        kde = gaussian_kde(rate_sim)
+        xs = np.linspace(bin_edges[0], bin_edges[-1], 400)
+        ys = kde(xs) * len(rate_sim) * bin_width
+        ax.plot(xs, ys, color="red", linewidth=1.2)
+    else:
+        # Degenerate case: all values identical (e.g., mostly zero incidents)
+        # Skip KDE overlay to avoid matplotlib zero-width error
+        pass
     ax.set_title("Successful Incidents / Year (posterior)")
-    ax.set_xlabel("Incidents/year"); ax.set_ylabel("Count")
+    ax.set_xlabel("Incidents/year")
+    ax.set_ylabel("Count")
     _annotate_percentiles(ax, rate_sim, money=False)
+
 
     ax = axs[1,1]
     ax.hist(losses_plot, bins=60, edgecolor="black")

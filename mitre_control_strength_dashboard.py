@@ -821,8 +821,17 @@ def get_technique_simulation_inputs(
         for tech_ext in sorted(set(techniques_by_tactic[tactic])):
 
             if tech_ext not in technique_strengths:
-                # Technique exists but has no mitigations → treat as unmitigated
-                technique_priors[tactic][tech_ext] = {"p_min": 0.0, "p_max": 0.0}
+                # Technique exists but has no mitigations → treat as UNMITIGATED
+                #
+                # IMPORTANT:
+                #   p_min / p_max represent ATTACKER SUCCESS probability
+                #   after controls, NOT control strength.
+                #
+                #   Unmitigated == no blocking == success probability = 1.0
+                technique_priors[tactic][tech_ext] = {
+                    "p_min": 1.0,
+                    "p_max": 1.0,
+                }
                 continue
 
             s = technique_strengths[tech_ext]
