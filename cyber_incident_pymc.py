@@ -172,6 +172,11 @@ observed_years = None
 BN_CHAIN_SEMANTICS = "retry_detect_aware"
 
 # =============================================================================
+# Technique statistics export behavior
+# =============================================================================
+EXPORT_ALL_TECHNIQUES = True
+
+# =============================================================================
 # MITRE STAGES (canonical fallback)
 # =============================================================================
 MITRE_STAGES = [
@@ -1313,7 +1318,11 @@ def _simulate_annual_losses(lambda_draws, succ_chain_draws, succ_mat,
 
         # Save to CSV in the same output directory
         ts = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
-        csv_path = os.path.join(OUTPUT_DIR, f"top_techniques_{ts}.csv")
+        label = "all" if EXPORT_ALL_TECHNIQUES else "top10"
+        csv_path = os.path.join(
+            OUTPUT_DIR,
+            f"techniques_{label}_{ts}.csv"
+        )
         df = pd.DataFrame(
             [
                 {
@@ -1324,7 +1333,9 @@ def _simulate_annual_losses(lambda_draws, succ_chain_draws, succ_mat,
                     "Failures": failures,
                     "SuccessRate": rate,
                 }
-                for tactic, tech, attempts, succ, failures, rate in top_ten
+                for tactic, tech, attempts, succ, failures, rate in (
+                    technique_rows if EXPORT_ALL_TECHNIQUES else top_ten
+                )
             ]
         )
         df.to_csv(csv_path, index=False)
@@ -1594,16 +1605,24 @@ def parse_args():
                    help="Print the per-tactic control strength parameters used (for diagnostics).")
     p.add_argument("--no-stochastic-impact", action="store_true",
                    help="Disable stochastic impact reduction (use mean instead).")
+    p.add_argument(
+        "--export-all-techniques",
+        action="store_true",
+        help="Export statistics for all in-scope techniques instead of only top 10."
+    )
     return p.parse_args()
 
 def main():
     global ADAPTABILITY_STOCHASTIC, STOCHASTIC_IMPACT_REDUCTION
+    global EXPORT_ALL_TECHNIQUES
 
     args = parse_args()
     if args.no_adapt_stochastic:
         ADAPTABILITY_STOCHASTIC = False
     if args.no_stochastic_impact:
         STOCHASTIC_IMPACT_REDUCTION = False
+    if args.export_all_techniques:
+        EXPORT_ALL_TECHNIQUES = True
 
     # Load tactic subset & ranges from dashboard or fallback to SME map
     tactics_included, stage_map, impact_controls, mode = _load_from_dashboard_or_fallback(args.dataset, args.csv)
