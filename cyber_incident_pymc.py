@@ -141,11 +141,16 @@ MAX_FALLBACKS_PER_CHAIN = 3
 PLOT_IN_MILLIONS = True
 
 # =============================================================================
-# Variables: Adaptability (stochastic per retry) — logistic update mode
+# Variables: Adaptability (stochastic per retry)
 # =============================================================================
-# Adaptability controls how quickly an attacker learns from failed attempts.
+# Adaptability controls whether an attacker persists and retries after a failed
+# technique or tactic. It is sampled once per simulated path and used as a
+# probability threshold: the attacker retries only if a uniform draw falls
+# below actor_adapt. A higher value means the attacker is more tenacious and
+# likely to attempt another technique after a failure; a lower value means the
+# attacker gives up sooner.
 ADAPTABILITY_STOCHASTIC = True
-ADAPTABILITY_RANGE = (0.3, 0.7)        # higher = faster learning on retries
+ADAPTABILITY_RANGE = (0.3, 0.7)        # higher = more likely to retry after failure
 ADAPTABILITY_MODE = "logistic"         # "logistic" (recommended) or "linear" (legacy)
 ADAPTABILITY_EFFECT_SCALE = 1.0        # multiplier for linear mode; 1.0 = default
 
@@ -208,15 +213,18 @@ _SME_STAGE_CONTROL_MAP_FALLBACK = {
 # =============================================================================
 loss_categories = ["Productivity", "ResponseContainment", "RegulatoryLegal", "ReputationCompetitive"]
 
-# Lognormal parameters from 5th and 95th percentiles (per category)
+# Lognormal parameters from 5th and 95th percentiles (per category).
+# RegulatoryLegal and ReputationCompetitive use a non-zero 5th percentile
+# ($1,000) representing the minimum realistic cost (e.g., notification
+# letters, minor reputation-management spend) for any successful incident.
+# Using 0 is invalid for a lognormal and was previously clamped to 1,
+# which produced an unrealistically wide distribution (σ≈4.5, mean≈$49M).
 loss_q5_q95 = {
     "Productivity": (1_000, 200_000),
     "ResponseContainment": (10_000, 1_000_000),
-    "RegulatoryLegal": (0, 3_000_000),
-    "ReputationCompetitive": (0, 5_000_000),
+    "RegulatoryLegal": (1_000, 3_000_000),
+    "ReputationCompetitive": (1_000, 5_000_000),
 }
-
-Z_90 = 1.645  # reused
 
 def _lognormal_from_q5_q95(q5: float, q95: float):
     q5, q95 = max(q5, 1.0), max(q95, q5 * 1.0001)
@@ -440,6 +448,7 @@ def _simulate_attacker_path(sim_struct, rng, tc=None, tech_posteriors=None, reco
 
             detect_prob = DETECT_BASE
             if record_path:
+                path_log.append({"stage": i, "result": "pending"})
                 path_log[-1]["success_prob"] = p_stage
                 path_log[-1]["detect_prob"] = detect_prob
             retries_left = MAX_RETRIES_PER_STAGE
@@ -509,6 +518,11 @@ def _simulate_attacker_path(sim_struct, rng, tc=None, tech_posteriors=None, reco
     current_tactic_index = 0
     fallback_count = 0
 
+    # Detection probability accumulates across the entire attack chain.
+    # Initialised once here so that failed attempts at early tactics raise
+    # the exposure level carried into every subsequent tactic.
+    detect_prob = DETECT_BASE
+
     while 0 <= current_tactic_index < n_tactics:
         tactic_name = tactics[current_tactic_index]
         tech_list = techniques_by_tactic.get(tactic_name, [])
@@ -567,16 +581,8 @@ def _simulate_attacker_path(sim_struct, rng, tc=None, tech_posteriors=None, reco
         if tc is not None:
             p_stage = float(np.clip(tc * p_stage, 0.0, 1.0))
 
-        # --------------------------------------------------------
-        # DETECTION probability (BN posterior if available)
-        # --------------------------------------------------------
-        detect_prob = DETECT_BASE
-        if tech_posteriors is not None:
-            key_det = (tactic_name, tech_id, "detect")
-            det_arr = tech_posteriors.get(key_det)
-            if det_arr is not None and det_arr.size > 0:
-                didx = rng.integers(0, det_arr.size)
-                detect_prob = float(np.clip(det_arr[didx], 0.0, 1.0))
+        # Detection probability is a chain-wide accumulator (initialised once
+        # before the tactic loop). No per-technique reset here.
 
         retries_left = MAX_RETRIES_PER_STAGE
         stage_completed = False
@@ -1246,8 +1252,12 @@ def _simulate_annual_losses(lambda_draws, succ_chain_draws, succ_mat,
 
                 if cat == "RegulatoryLegal":
                     reg = base_draw
-                    # Occasional heavy legal tail
-                    if rng.random() < 0.025:
+                    # Occasional heavy legal tail; encryption controls reduce
+                    # both the probability of a catastrophic exposure event and
+                    # its magnitude (magnitude reduction via encrypt_s is applied
+                    # below in the impact-reduction block).
+                    reg_tail_prob = 0.025 * max(0.0, 1.0 - encrypt_s * ENCRYPT_IMPACT_MULT)
+                    if rng.random() < reg_tail_prob:
                         xm = pareto_defaults[cat]["xm"]
                         alpha = pareto_defaults[cat]["alpha"]
                         u = rng.uniform(0.001, 0.999)
@@ -1257,8 +1267,9 @@ def _simulate_annual_losses(lambda_draws, succ_chain_draws, succ_mat,
 
                 elif cat == "ReputationCompetitive":
                     rep = base_draw
-                    # Occasional heavy reputation tail
-                    if rng.random() < 0.015:
+                    # Occasional heavy reputation tail; same encrypt_s scaling.
+                    rep_tail_prob = 0.015 * max(0.0, 1.0 - encrypt_s * ENCRYPT_IMPACT_MULT)
+                    if rng.random() < rep_tail_prob:
                         xm = pareto_defaults[cat]["xm"]
                         alpha = pareto_defaults[cat]["alpha"]
                         u = rng.uniform(0.001, 0.999)
